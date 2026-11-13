@@ -6,7 +6,7 @@ numpy>=1.24.0
 click>=8.1.0
 pyyaml>=6.0
 rich>=13.0
-tomli>=1.1; python_version < "3.11"
+tomli>=2.5.0; python_version < "3.11"
 
 # Visualization
 matplotlib>=3.7.0
