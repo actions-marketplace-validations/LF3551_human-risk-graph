@@ -15,7 +15,7 @@ R = (1 - (1 - aK)(1 - bD)(1 - cB)) / (1 - (1 - a)(1 - b)(1 - c)), score = 100 * 
 """
 
 from math import prod
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
@@ -53,6 +53,63 @@ def support_graph(graph: nx.DiGraph) -> nx.Graph:
     return support
 
 
+def separations(graph: nx.Graph) -> Dict[Any, List[int]]:
+    """
+    For every articulation point of an undirected graph, the sizes of the parts its
+    component splits into when it is removed (largest first), from one depth-first search
+    with Tarjan's low-link: O(V + E) instead of a search per articulation point.
+
+    In the DFS tree, a child subtree whose low-link does not reach above a vertex is cut off
+    when the vertex is removed; for a vertex other than the root, the rest of the component
+    stays together. The root is an articulation point when it has two or more children.
+    Self-loops are ignored.
+    """
+    disc: Dict[Any, int] = {}
+    low: Dict[Any, int] = {}
+    size: Dict[Any, int] = {}
+    result: Dict[Any, List[int]] = {}
+    for root in graph:
+        if root in disc:
+            continue
+        cut = _dfs_cuts(graph, root, disc, low, size)
+        for node, parts in cut.items():
+            if node == root:
+                if len(parts) >= 2:
+                    result[node] = sorted(parts, reverse=True)
+                continue
+            rest = size[root] - 1 - sum(parts)
+            result[node] = sorted(parts + ([rest] if rest else []), reverse=True)
+    return result
+
+
+def _dfs_cuts(graph, root, disc, low, size) -> Dict[Any, List[int]]:
+    """Iterative DFS from ``root``: sizes of the child subtrees each vertex cuts off."""
+    cut: Dict[Any, List[int]] = {}
+    disc[root] = low[root] = len(disc)
+    size[root] = 1
+    stack = [(root, None, iter(graph[root]))]
+    while stack:
+        node, parent, neighbours = stack[-1]
+        child = next(neighbours, None)
+        if child is not None:
+            if child == node or child == parent:
+                continue
+            if child in disc:
+                low[node] = min(low[node], disc[child])
+            else:
+                disc[child] = low[child] = len(disc)
+                size[child] = 1
+                stack.append((child, node, iter(graph[child])))
+            continue
+        stack.pop()
+        if parent is not None:
+            size[parent] += size[node]
+            low[parent] = min(low[parent], low[node])
+            if low[node] >= disc[parent]:
+                cut.setdefault(parent, []).append(size[node])
+    return cut
+
+
 def key_person_impacts(graph: nx.DiGraph) -> Dict[str, Dict[str, float]]:
     """
     Impact of losing each single point of failure.
@@ -65,17 +122,13 @@ def key_person_impacts(graph: nx.DiGraph) -> Dict[str, Dict[str, float]]:
     undirected = support_graph(graph)
     components = list(nx.connected_components(undirected))
     total_pairs = sum(_pairs(len(c)) for c in components)
-    component_of = {node: comp for comp in components for node in comp}
+    component_size = {node: len(comp) for comp in components for node in comp}
 
     impacts = {}
-    for person in nx.articulation_points(undirected):
-        component = component_of[person]
-        pairs_among_others = total_pairs - (len(component) - 1)
-        parts = sorted(
-            (len(c) for c in nx.connected_components(undirected.subgraph(component - {person}))),
-            reverse=True,
-        )
-        lost = _pairs(len(component) - 1) - sum(_pairs(p) for p in parts)
+    for person, parts in separations(undirected).items():
+        size = component_size[person]
+        pairs_among_others = total_pairs - (size - 1)
+        lost = _pairs(size - 1) - sum(_pairs(p) for p in parts)
         impacts[person] = {
             "impact": lost / pairs_among_others if pairs_among_others else 0.0,
             "cut_off": sum(parts[1:]),
@@ -148,7 +201,7 @@ def override_factors(edge_types: Dict[Edge, str], reviewed: Set[Edge]) -> Dict[s
     return factors
 
 
-def composite_risk(metrics: Tuple[float, ...], weights: Tuple[float, ...]):
+def composite_risk(metrics: Tuple[float, ...], weights: Tuple[float, ...]) -> float:
     """
     Normalised noisy-OR: R = (1 - prod(1 - w_i m_i)) / (1 - prod(1 - w_i)).
 
@@ -193,7 +246,7 @@ def calculate_v2(
     critical = {node for node, crit in criticality.items() if crit >= critical_threshold}
 
     impacts = key_person_impacts(graph)
-    key_people = sorted(
+    key_people: List[Dict[str, Any]] = sorted(
         (
             {
                 "id": person,
@@ -206,7 +259,7 @@ def calculate_v2(
         ),
         key=lambda p: (-p["risk"], p["id"]),
     )
-    key_person_risk = key_people[0]["risk"] if key_people else 0.0
+    key_person_risk: float = key_people[0]["risk"] if key_people else 0.0
 
     shares = approval_shares(edge_types, weights)
     concentration = sum(s * s for s in shares.values())

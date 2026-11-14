@@ -39,13 +39,16 @@ afford to lose, and tells you **which three changes raise your score the most**.
 - **A fix plan, not just a diagnosis**: deputies and second-person checks simulated on your
   data and ranked by score gain.
 - **No YAML to start**: `hrg scan github` drafts the organization from one repository or
-  a whole GitHub organization (who reviews, merges, releases and can bypass).
+  a whole GitHub organization (who reviews, merges, releases, deploys and can bypass).
+- **Stale authority**: people who can still merge, release or deploy but have not been
+  active for 90 days are reported, with what the two-person rule is really left with.
 - **Built for pipelines and audits**: SARIF for GitHub code scanning, JUnit, a `--min-score`
   gate, `hrg diff` between snapshots, findings mapped to ISO/IEC 27001, SOC 2 and DORA.
 - **Privacy by design**: `--pseudonymize` replaces people by keyed pseudonyms in every
   report, for GDPR and works-council requirements; nothing leaves your machine.
-- **Tested against outcomes**: in a [pre-registered study](docs/validation-hrg3.md), a single
-  releaser predicted which popular PyPI projects stopped releasing (4.8 times the rate).
+- **Tested against outcomes**: in a [retrospective study](docs/validation-hrg3.md), with the
+  protocol committed before data collection, a single releaser predicted which popular PyPI
+  projects stopped releasing (4.8 times the rate).
 - **A report you can hand over**: one offline HTML file with an interactive dependency map,
   readable on a phone and printable as PDF.
 
@@ -82,7 +85,7 @@ hrg analyze my-org.yaml
 ```
 
 ```
-Human Risk Graph 0.15.2 · organization.yaml · 5 people · 5 dependencies
+Human Risk Graph 0.16.0 · organization.yaml · 5 people · 5 dependencies
 
   Score  25/100  ██░░░░░░░░  F · Critical risk  model hrg-2
 
@@ -112,6 +115,10 @@ hrg scan github my-org/payments-api        # uses GITHUB_TOKEN, GH_TOKEN or `gh 
 hrg analyze payments-api-org.yaml
 ```
 
+On GitHub Enterprise Server, add `--api-url https://github.example.com/api/v3` (the
+GitHub CLI token for that host is used, and in GitHub Actions `GITHUB_API_URL` is picked up
+automatically).
+
 The scan reads the most recent merged pull requests (`--max-prs`, default 100) and turns
 evidence into dependencies:
 
@@ -121,6 +128,9 @@ evidence into dependencies:
 | CODEOWNERS of the files a pull request changed (teams expanded when visible) | `approval` owner → author |
 | A pull request merged without an approving review, on a branch that requires reviews | `bypass` merger → approvers |
 | Ruleset bypass actors and branch protection allowances (when the token can see them) | `bypass` actor → approvers |
+
+For model hrg-3 the scan also drafts functions: merge, release, admin, and deploy from the
+repository's deployment environments ([below](#critical-functions-and-the-two-person-rule-hrg-3-experimental)).
 
 Permissions and history do not prove real authority, so the draft is for a person to
 review: every dependency carries `source`, `evidence` and `confirmed: false`, and reports
@@ -137,10 +147,11 @@ finds come from the approvers the projects declare in MAINTAINERS or OWNERS, and
 active approver is a declared one in every repository; see the reproducible
 [benchmark](docs/benchmark.md) and its limits.
 
-Does the score predict anything? In a [pre-registered study](docs/validation-hrg3.md) of
-284 popular PyPI projects, those whose releases were published by a single person before
-November 2024 stopped releasing in the following year 4.8 times as often (95% CI 1.5–15.3)
-as those with two or more release authors; a commit-based truck factor gave 1.9 (0.9–4.3).
+Does the score predict anything? In a [retrospective study](docs/validation-hrg3.md) of 284
+popular PyPI projects, with the protocol committed before data collection, those whose
+releases were published by a single person before November 2024 stopped releasing in the
+following year 4.8 times as often (95% CI 1.5–15.3) as those with two or more release
+authors; a commit-based truck factor gave 1.9 (0.9–4.3).
 Adjusted for release activity the ratio is 2.7 with an interval that includes 1, so part
 of the effect is project activity.
 
@@ -167,8 +178,8 @@ hrg analyze my-org-org.yaml --model hrg-3
 
 People appear once, with the highest criticality any repository gave them. Dependencies
 between the same two people are merged (a bypass in any repository outranks approvals; the
-weight is the highest seen). The `merge`, `release` and `admin` functions stay per
-repository (`payments-api/release`), so hrg-3 shows everything one person's absence stops
+weight is the highest seen). The `merge`, `release`, `admin` and `deploy-*` functions stay
+per repository (`payments-api/release`), so hrg-3 shows everything one person's absence stops
 across the organization. Repositories that cannot be read are listed under
 `coverage.gaps`; `--max-prs` (default 30 with `--org`) bounds the API calls per repository.
 
@@ -193,8 +204,9 @@ re-identification process and a deployment checklist (purpose, works council, DP
 ## HTML report
 
 One self-contained file that works offline, in light and dark mode, on a phone and as a PDF:
-score and verdict, fix plan, interactive dependency map, people, findings with related
-controls, the exact formula, and an audit trail with the input file's SHA-256.
+score and verdict, fix plan, interactive dependency map (for up to 400 people; `hrg visualize`
+draws larger organizations), people, findings with related controls, the exact formula,
+and an audit trail with the input file's SHA-256.
 [Open a live example](https://lf3551.github.io/human-risk-graph/demo/platform-team.html).
 
 <p align="center">
@@ -253,10 +265,22 @@ out of solo control and HRG006; it still counts as a single point of failure.
 hrg analyze examples/functions.yaml --model hrg-3
 ```
 
-`hrg scan github` drafts the `merge`, `release` and `admin` functions of a repository. A
-single-maintainer repository with no reviewers scores 100 under hrg-2 (there are no
-dependencies to break) and 0 under hrg-3, because one person merges, releases and
+`hrg scan github` drafts the `merge`, `release` and `admin` functions of a repository, and a
+`deploy-<environment>` function for each deployment environment with required reviewers or
+a production-like name (`production`, `pypi`, `release`, ...): who approves deployments,
+whether they can approve their own, whether admins can bypass the rules, and who deployed
+recently. A single-maintainer repository with no reviewers scores 100 under hrg-2 (there
+are no dependencies to break) and 0 under hrg-3, because one person merges, releases and
 administers alone. Definitions and properties: [docs/model-hrg3.md](docs/model-hrg3.md).
+
+**Inactive people with authority.** The scan also records when each person who can perform
+a function was last active (`last_active`: their latest merged pull request, approval,
+release, deployment or commit). hrg-3 then reports people inactive for more than 90 days
+(`--inactive-days`) as `HRG007`: the merge rule needs two reviewers but one of them left in
+spring, or a dormant account can still publish releases alone. The score itself does not
+change. Under the other models `hrg analyze` prints a one-line note when the file has
+inactive people, pointing to `--model hrg-3`. `--no-activity` records no dates
+([docs/privacy.md](docs/privacy.md)).
 
 ### What HRG is not
 
@@ -314,6 +338,8 @@ Describe your organization in a JSON or YAML file:
 - `people.id` — unique identifier
 - `people.role` — job title (optional)
 - `people.criticality` — importance level (0.0-1.0)
+- `people.last_active` — optional: date the person was last active (`2026-03-01`), or
+  `never`; model hrg-3 reports inactive performers (HRG007)
 - `dependencies.from/to` — person IDs
 - `dependencies.type` — relationship type (approval, bypass, etc.)
 - `dependencies.weight` — dependency strength (0.0-1.0)
@@ -380,6 +406,7 @@ expiry date instead of lowering the bar for everyone:
 
 ```toml
 min-score = 70
+inactive-days = 90   # optional, hrg-3: report people with authority inactive for longer
 pseudonymize = true  # optional: keyed pseudonyms in every report (key in HRG_PSEUDONYM_KEY)
 
 [weights]            # optional, must add up to 1
@@ -405,8 +432,9 @@ acceptance that no longer matches anything is reported as safe to remove. See
 
 Every finding has a rule ID (`HRG001` single point of failure, `HRG002` concentrated
 approval authority, `HRG003` bypass involving a critical person, `HRG004` risk above
-threshold; with `--model hrg-3` also `HRG005` function depends on too few people and
-`HRG006` critical function one person can complete alone) and related controls in
+threshold; with `--model hrg-3` also `HRG005` function depends on too few people,
+`HRG006` critical function one person can complete alone and `HRG007` function relies on
+inactive people) and related controls in
 ISO/IEC 27001:2022, SOC 2 and DORA. The mapping is informative, not a compliance
 assessment. See [docs/compliance.md](docs/compliance.md).
 
@@ -432,7 +460,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: LF3551/human-risk-graph@v0.15.2
+      - uses: LF3551/human-risk-graph@v0.16.0
         with:
           file: org/organization.yaml
           min-score: 70
@@ -442,7 +470,7 @@ Or draft the organization from the repository itself (approvals, CODEOWNERS, bra
 rules) and report on it, for example on a schedule:
 
 ```yaml
-      - uses: LF3551/human-risk-graph@v0.15.2
+      - uses: LF3551/human-risk-graph@v0.16.0
         with:
           scan: ${{ github.repository }}
 ```
@@ -451,7 +479,7 @@ Or the whole organization, with pseudonymized reports (the draft with real login
 not uploaded):
 
 ```yaml
-      - uses: LF3551/human-risk-graph@v0.15.2
+      - uses: LF3551/human-risk-graph@v0.16.0
         env:
           HRG_PSEUDONYM_KEY: ${{ secrets.HRG_PSEUDONYM_KEY }}
         with:
@@ -468,7 +496,10 @@ not uploaded):
 | `max-repos` | `30` | With `scan-org`: repositories to scan |
 | `max-prs` | `100` (`30` with `scan-org`) | Merged pull requests to read per repository |
 | `pseudonymize` | `false` | Keyed pseudonyms instead of people (key in `HRG_PSEUDONYM_KEY`) |
+| `model` | config, else `hrg-2` | `hrg-3` scores critical functions: merge, release, admin, deploy |
+| `inactive-days` | config, else `90` | With `hrg-3`: report people with authority inactive for longer (HRG007) |
 | `token` | `github.token` | Token for `scan` and `scan-org` |
+| `api-url` | `github.api_url` | GitHub API for `scan` and `scan-org`; GitHub Enterprise Server works without setting it |
 | `config` | auto | `hrg.toml`, `.hrg.toml` or `[tool.hrg]` in `pyproject.toml` |
 | `min-score` / `fail-above` | | Fail below this score (0-100) / above this risk (0-1) |
 | `upload-sarif` | `true` | Upload findings to code scanning (with `file`) |

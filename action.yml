@@ -34,8 +34,20 @@ inputs:
     description: GitHub token used by `scan`.
     required: false
     default: ${{ github.token }}
+  api-url:
+    description: GitHub API used by `scan` and `scan-org`; the default is the API of the GitHub the workflow runs on, so GitHub Enterprise Server works without setting it.
+    required: false
+    default: ${{ github.api_url }}
   config:
     description: Config file (default hrg.toml, .hrg.toml or [tool.hrg] in pyproject.toml in the working directory).
+    required: false
+    default: ""
+  model:
+    description: Scoring model (hrg-1, hrg-2 or hrg-3); hrg-3 scores critical functions such as merge, release and deploy. Default from the config, else hrg-2.
+    required: false
+    default: ""
+  inactive-days:
+    description: With hrg-3, people whose last activity is older than this many days are reported as inactive (HRG007). Default from the config, else 90.
     required: false
     default: ""
   min-score:
@@ -135,7 +147,10 @@ runs:
         HRG_MAX_PRS: ${{ inputs.max-prs }}
         HRG_PSEUDONYMIZE: ${{ inputs.pseudonymize }}
         HRG_GITHUB_TOKEN: ${{ inputs.token }}
+        HRG_GITHUB_API_URL: ${{ inputs.api-url }}
         HRG_CONFIG: ${{ inputs.config }}
+        HRG_MODEL: ${{ inputs.model }}
+        HRG_INACTIVE_DAYS: ${{ inputs.inactive-days }}
         HRG_MIN_SCORE: ${{ inputs.min-score }}
         HRG_FAIL_ABOVE: ${{ inputs.fail-above }}
         HRG_OUT: ${{ inputs.output-dir }}
@@ -171,6 +186,8 @@ runs:
         args=(analyze "$input" --format all --format sarif --output "$HRG_OUT/report" --no-visualize)
         if [ "$HRG_PSEUDONYMIZE" = "true" ]; then args+=(--pseudonymize); fi
         if [ -n "$HRG_CONFIG" ]; then args+=(--config "$HRG_CONFIG"); fi
+        if [ -n "$HRG_MODEL" ]; then args+=(--model "$HRG_MODEL"); fi
+        if [ -n "$HRG_INACTIVE_DAYS" ]; then args+=(--inactive-days "$HRG_INACTIVE_DAYS"); fi
         if [ -n "$HRG_MIN_SCORE" ]; then args+=(--min-score "$HRG_MIN_SCORE"); fi
         if [ -n "$HRG_FAIL_ABOVE" ]; then args+=(--fail-above "$HRG_FAIL_ABOVE"); fi
         # Exit code 3 is a threshold breach: publish the reports first, fail in the last step.

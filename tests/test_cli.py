@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -98,7 +99,7 @@ def test_model_v3_end_to_end(tmp_path):
 
     report = json.loads((tmp_path / "functions_report.json").read_text())
     assert report["results"]["model"] == "hrg-3"
-    assert {f["rule_id"] for f in report["findings"]} == {"HRG002", "HRG005", "HRG006"}
+    assert {f["rule_id"] for f in report["findings"]} == {"HRG002", "HRG005", "HRG006", "HRG007"}
     assert "(by policy)" in (tmp_path / "functions_report.md").read_text()
     assert "## 🔑 Critical Functions" in (tmp_path / "functions_report.md").read_text()
     html = (tmp_path / "functions_report.html").read_text()
@@ -112,7 +113,7 @@ def test_model_v3_end_to_end(tmp_path):
             line = lines[res["locations"][0]["physicalLocation"]["region"]["startLine"] - 1]
             assert line.strip().startswith("- id:"), line
     junit = (tmp_path / "functions_report.junit.xml").read_text()
-    assert 'tests="4"' in junit and "HRG006" in junit and "HRG001" not in junit
+    assert 'tests="5"' in junit and "HRG006" in junit and "HRG001" not in junit
 
 
 def test_model_v3_needs_functions(org):
@@ -214,6 +215,42 @@ def test_html_report_escapes_names(tmp_path):
     html = (tmp_path / "org_report.html").read_text()
     assert "<script>x</script>" not in html
     assert "&lt;script&gt;" in html
+
+
+def test_graph_tooltips_are_plain_text(tmp_path):
+    # vis-network renders string titles with innerText: markup would show literally.
+    path = tmp_path / "org.yaml"
+    path.write_text(
+        "people:\n"
+        "  - {id: a, name: '<script>x</script>', role: Lead, criticality: 0.9}\n"
+        "  - {id: b}\n"
+        "  - {id: c}\n"
+        "dependencies:\n"
+        "  - {from: b, to: a, type: approval}\n"
+        "  - {from: a, to: c, type: approval}\n"
+        "  - {from: c, to: a, type: bypass}\n"
+    )
+
+    result = run("visualize", path)
+
+    assert result.exit_code == 0, result.output
+    html = (tmp_path / "org_graph.html").read_text(encoding="utf-8")
+    nodes = json.loads(re.search(r"nodes = new vis\.DataSet\((\[.*?\])\);", html).group(1))
+    edges = json.loads(re.search(r"edges = new vis\.DataSet\((\[.*?\])\);", html).group(1))
+    titles = [item["title"] for item in nodes + edges]
+    assert all("<br>" not in t and "<b>" not in t for t in titles)
+    lead = next(n for n in nodes if n["id"] == "a")
+    assert lead["title"].splitlines()[:2] == ["<script>x</script>", "ID: a"]
+    assert "Role: Lead" in lead["title"] and "CRITICAL NODE" in lead["title"]
+    bypass = next(e for e in edges if e["from"] == "c")
+    assert bypass["title"].splitlines() == [
+        "Bypass Route",
+        "From: c",
+        "To: <script>x</script>",
+        "Type: bypass",
+        "Weight: 0.50",
+    ]
+    assert "<script>x</script>" not in html  # names are JSON-escaped inside the page
 
 
 def test_yaml_id_must_be_string(tmp_path):

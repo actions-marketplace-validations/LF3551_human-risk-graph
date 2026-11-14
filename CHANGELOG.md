@@ -5,6 +5,59 @@ All notable changes to Human Risk Graph will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### ✨ Added
+
+- Under hrg-1 and hrg-2, `hrg analyze` prints a note when people in the file have no activity seen for over `inactive-days` (`last_active`), pointing to `--model hrg-3` and HRG007 when the file has functions; HRG007 itself stays a hrg-3 rule.
+- **GitHub Enterprise Server:** `hrg scan github --api-url https://HOST/api/v3` (also `HRG_GITHUB_API_URL`, and `GITHUB_API_URL` as GitHub Actions sets it); the GitHub CLI token for that host is used. Action input `api-url`, by default the API of the GitHub the workflow runs on.
+
+### ⚡ Performance
+
+- Key-person impacts (hrg-1/hrg-2) come from one depth-first search (Tarjan's low-link) instead of a search per articulation point: the fix plan for 3,000 people takes under a second instead of about five minutes. Results are identical (checked against the previous implementation on random graphs and on the example reports).
+- The HTML report draws the dependency map for up to 400 people and says so above that; `hrg analyze` with every report for 3,000 people takes seconds instead of minutes. `hrg visualize` still draws everyone.
+
+### 🔬 Research
+
+- Protocol of a second study, [docs/study-two-person.md](docs/study-two-person.md): two-person control and dormant authority over publishing in the 1,000 most downloaded PyPI packages, with its collection and analysis code (`benchmark/two_person.py`) and tests, fixed before any data in the sample was collected and registered on OSF ([doi:10.17605/OSF.IO/J8ZFG](https://doi.org/10.17605/OSF.IO/J8ZFG)).
+- Helpers for the steps after collection (`benchmark/two_person_review.py`): a checklist for the manual measurement check with the evidence of each project (publishing workflow lines, environment settings, provenance of every file), its scoring into an aggregate agreement, and private-notification drafts with each project's channel (GitHub private vulnerability reporting, else its security policy, else none). They read the collection cache with the registered functions and never change the data.
+
+### 📝 Documentation
+
+- The validation study is described as a retrospective study with the protocol committed before data collection, not as pre-registered: the protocol was committed to this repository, not to an independent registry, and the outcome data already existed (README, `CITATION.cff`, `.zenodo.json`, the 0.14.1 entry below).
+
+## [0.16.0] - 2026-11-14
+
+### ✨ Added
+
+- **Deploy functions from GitHub Environments** (model hrg-3): `hrg scan github` drafts `deploy-<environment>` for every deployment environment with required reviewers, as a two-person rule (`requires: 2`): one person starts the deployment, a reviewer approves it. Performers are the reviewers (teams expanded when visible) and the people who created the last 30 deployments; `alone` holds the reviewers unless *Prevent self-review* is on, and the admins when they can bypass the environment's rules. Environments without reviewers are drafted when their name looks like a production or publishing target (`production`, `pypi`, `release`, ...), as a function anyone who deploys completes alone. Deployments by bots are not counted.
+- **Inactive people with authority** (`HRG007`, model hrg-3): people can carry `last_active` (a date, or `never`), and performers inactive for more than `inactive-days` (default 90; `--inactive-days`, `inactive-days` in `hrg.toml`, action input `inactive-days`) are reported with how the function's margin drops without them. A critical function active people cannot perform, or that an inactive account can still complete alone, is an error. The score does not change. Mapped to ISO/IEC 27001 A.5.18, A.8.2, A.5.30; SOC 2 CC6.2, CC6.3, CC9.1; DORA Art. 9(4)(c), 11(2)(a).
+- The scan records `last_active` for people who can perform a function: the latest pull request, approval, release or deployment it read, or their last commit on the branch (at most 30 lookups per repository). `--no-activity` records nothing. Organization scans and re-scans keep the latest date.
+- GitHub Action inputs `model` and `inactive-days`.
+
+### 📝 Documentation
+
+- [docs/model-hrg3.md](docs/model-hrg3.md): deploy functions, last activity and HRG007; [docs/compliance.md](docs/compliance.md): HRG007 and access reviews; [docs/privacy.md](docs/privacy.md): the activity date that is processed, why, and how to turn it off; schema: `people.last_active`.
+
+## [0.15.3] - 2026-11-14
+
+### 🐛 Fixed
+
+- hrg-1 reports listed the critical people (articulation points) in a different order on every run, so JSON, Markdown and pseudonymized reports of the same input differed; they are now sorted.
+- Tooltips of the interactive graph (`*_graph.html`) showed raw `<b>` and `<br>` tags: vis-network displays titles as plain text. They are now plain text with line breaks.
+- The graph visualization computed betweenness centrality and articulation points once per person; they are computed once (`HumanRiskGraph.analyze_nodes()`), and the file is read and written as UTF-8 on every platform.
+
+### 🔒 Security
+
+- `GitHubClient` requires an `https` API URL and refuses to send the token to a URL outside the API, for example through a `Link` pagination header.
+- `bandit` findings were reviewed and justified inline (`bandit -c pyproject.toml -r src/` is clean); `pip-audit` is in the hashed dev lock.
+
+### 🔧 Changed
+
+- black, flake8 (with the complexity limit) and mypy (now with `check_untyped_defs`) report no findings.
+- CI: black, flake8 and mypy run in a separate job with the versions pinned in `requirements.txt` and fail the build; before, they were advisory. `bandit` and `pip-audit` (on the hashed lock) fail the build too; the previous `safety check` step needed an account and its failures were ignored. The test matrix no longer installs the linters.
+- Refactored the 15 functions above the complexity limit (`hrg analyze`, `hrg scan github`, the GitHub scanner, report generation, configuration and input validation) into smaller functions, and fixed all type errors. Apart from the fixes above, reports and drafts are unchanged: compared byte for byte on the examples and on every GitHub scan scenario of the test suite.
+
 ## [0.15.2] - 2026-11-13
 
 ### 🗑️ Removed
@@ -46,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 🔬 Validation
 
-- [Pre-registered predictive study](docs/validation-hrg3.md) of the hrg-3 release function on 284 popular PyPI projects: a single releaser before 2024-11-01 went with a 4.8 times higher rate of no release in the following year (95% CI 1.5–15.3; commit truck factor: 1.9, 0.9–4.3). Adjusted for release activity: 2.7 (0.8–9.2). Protocol committed before data collection; data and code in `benchmark/validation/` and `benchmark/validate.py`.
+- [Retrospective predictive study](docs/validation-hrg3.md) of the hrg-3 release function on 284 popular PyPI projects: a single releaser before 2024-11-01 went with a 4.8 times higher rate of no release in the following year (95% CI 1.5–15.3; commit truck factor: 1.9, 0.9–4.3). Adjusted for release activity: 2.7 (0.8–9.2). Protocol committed before data collection; data and code in `benchmark/validation/` and `benchmark/validate.py`.
 
 ### 🔒 Security
 

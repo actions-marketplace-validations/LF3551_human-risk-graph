@@ -25,6 +25,7 @@ keywords = [
     "iso27001",
     "gdpr",
     "segregation-of-duties",
+    "access-review",
     "github",
 ]
 classifiers = [
@@ -111,9 +112,13 @@ extend-exclude = '''
 
 [tool.mypy]
 python_version = "3.10"
+files = ["src"]
 warn_return_any = false
 warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
 disallow_untyped_defs = false
+check_untyped_defs = true
 ignore_missing_imports = true
 
 [tool.coverage.run]
@@ -137,3 +142,7 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "@abstractmethod",
 ]
+
+[tool.bandit]
+# B608 (SQL built from strings): there is no SQL; it flags f-strings of HTML/SVG markup.
+skips = ["B608"]

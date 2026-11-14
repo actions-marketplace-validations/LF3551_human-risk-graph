@@ -16,9 +16,10 @@ import csv
 import hashlib
 import sys
 from collections import Counter
-from pathlib import Path
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console
 from click.core import ParameterSource
@@ -26,10 +27,12 @@ from click.core import ParameterSource
 from . import __version__
 from . import diff as diff_module
 from .ci_reports import generate_junit_report, generate_sarif_report
-from .config import Config, ConfigError, apply_acceptances, load_config
+from .config import Acceptance, Config, ConfigError, apply_acceptances, load_config
 from .console import render_summary
-from .findings import collect_findings, threshold_breach
+from .activity import DEFAULT_INACTIVE_DAYS, is_inactive
+from .findings import Finding, collect_findings, threshold_breach
 from .github_scan import (
+    API,
     GitHubClient,
     GitHubError,
     GitHubScanner,
@@ -40,7 +43,7 @@ from .github_scan import (
 )
 from .hrg import HumanRiskGraph
 from .loader import load_organization, organization_schema
-from .model_v2 import MODEL_V2, MODELS
+from .model_v2 import MODEL_V2, MODEL_V3, MODELS
 from .privacy import KEY_ENV, PseudonymKeyError, Pseudonymizer, load_key
 from .reports import (
     generate_html_report,
@@ -205,13 +208,20 @@ def cli():
     show_default=True,
     help="Number of remediations to simulate and rank (0 to skip).",
 )
+@click.option(
+    "--inactive-days",
+    type=click.IntRange(1, 3650),
+    default=DEFAULT_INACTIVE_DAYS,
+    show_default=True,
+    help="hrg-3: people whose last_active is older than this many days are inactive (HRG007).",
+)
 @click.option("--quiet", "-q", is_flag=True, help="Only print errors.")
 @privacy_options
 @CONFIG_OPTION
 @click.pass_context
 def analyze(
-    ctx, input_file, formats, output, visualize, fail_above, min_score, model, fix_steps, quiet,
-    pseudonymize, pseudonym_key_file, config_path,
+    ctx, input_file, formats, output, visualize, fail_above, min_score, model, fix_steps,
+    inactive_days, quiet, pseudonymize, pseudonym_key_file, config_path,
 ):  # fmt: skip
     """
     Analyze an organization's human risk graph.
@@ -232,10 +242,81 @@ def analyze(
     min_score = _setting(ctx, "min_score", min_score, config.min_score)
     fail_above = _setting(ctx, "fail_above", fail_above, config.fail_above)
     pseudonymize = _setting(ctx, "pseudonymize", pseudonymize, config.pseudonymize)
+    inactive_days = _setting(ctx, "inactive_days", inactive_days, config.inactive_days)
     calc = {"model": model, **config.calculate_kwargs()}
+    thresholds = {"fail_above": fail_above, "min_score": min_score}
 
+    run = _run_analysis(
+        input_file, config, calc, pseudonymize, pseudonym_key_file, fix_steps, inactive_days,
+        **thresholds,
+    )  # fmt: skip
+    pz = run.pz
+    input_path = Path(input_file)
+    base_name = pz.scrub(input_path.stem) if pz else input_path.stem
+    output_dir = input_path.parent if not output else Path(output).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metadata = _metadata(input_path, run.data, config, calc, pz)
+
+    formats_to_generate = _expand_formats(formats)
+    if output and len(formats_to_generate) == 1:
+        targets = {formats_to_generate[0]: Path(output)}  # user specified output file
+    else:
+        targets = {
+            f: output_dir / f"{base_name}_report{EXTENSIONS[f]}" for f in formats_to_generate
+        }
+    generated_files, failed = _write_reports(targets, run, metadata, input_path, **thresholds)
+    if visualize:
+        generated_files += _write_visualization(run, output_dir / f"{base_name}_graph.html")
+
+    if not quiet:
+        render_summary(
+            Console(highlight=False),
+            input_file,
+            run.data,
+            run.results,
+            run.findings,
+            run.fixes,
+            generated_files,
+            run.breach,
+            config_file=metadata["config_file"],
+            confirmed_only=metadata["confirmed_only"],
+        )
+        if pz:
+            click.echo(f"Privacy: {privacy_text(metadata)}")
+        hint = inactivity_hint(run.data, run.results.get("model"), inactive_days)
+        if hint:
+            click.echo(hint)
+    _warn_acceptances(run.unused, run.findings)
+
+    if failed:
+        sys.exit(1)
+    if run.breach:
+        if quiet:
+            click.echo(f"Error: {run.breach}", err=True)
+        sys.exit(EXIT_RISK)
+
+
+@dataclass
+class _Analysis:
+    """Everything ``analyze`` computes before writing reports."""
+
+    data: Dict[str, Any]
+    hrg: HumanRiskGraph
+    pz: Optional[Pseudonymizer]
+    results: Dict[str, Any]
+    findings: List[Finding]
+    unused: List[Acceptance]
+    fixes: List[Dict[str, Any]]
+    breach: Optional[str]
+
+
+def _run_analysis(
+    input_file, config: Config, calc, pseudonymize, key_file, fix_steps, inactive_days,
+    fail_above, min_score,
+) -> _Analysis:  # fmt: skip
+    """Load, optionally pseudonymize, score, collect findings and plan fixes; exits on errors."""
     data, hrg = _load(input_file)
-    pz = _pseudonymizer(pseudonymize, pseudonym_key_file)
+    pz = _pseudonymizer(pseudonymize, key_file)
     accept = config.accept
     if pz:
         data, hrg = _pseudonymized(pz, data)
@@ -245,19 +326,17 @@ def analyze(
     except ValueError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
-    findings = collect_findings(hrg, results, fail_above, min_score)
+    findings = collect_findings(hrg, results, fail_above, min_score, inactive_days)
     findings, unused = apply_acceptances(findings, accept)
     fixes = hrg.fix_plan(steps=fix_steps, **calc) if fix_steps else []
     breach = threshold_breach(results, fail_above, min_score)
     if breach and any(f.rule_id == "HRG004" and f.accepted for f in findings):
         breach = None
+    return _Analysis(data, hrg, pz, results, findings, unused, fixes, breach)
 
-    # Prepare metadata
-    input_path = Path(input_file)
-    base_name = pz.scrub(input_path.stem) if pz else input_path.stem
-    output_dir = input_path.parent if not output else Path(output).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
 
+def _metadata(input_path: Path, data, config: Config, calc, pz) -> Dict[str, Any]:
+    """Report metadata: the input, its size, data quality and how it was processed."""
     person_lookup = {
         person["id"]: {
             "name": person.get("name", person["id"]),
@@ -266,12 +345,7 @@ def analyze(
         }
         for person in data["people"]
     }
-
-    dependency_type_counts = {}
-    for dep in data["dependencies"]:
-        dep_type = dep.get("type", "unknown")
-        dependency_type_counts[dep_type] = dependency_type_counts.get(dep_type, 0) + 1
-
+    functions = data.get("functions") or []
     metadata = {
         # As given on the command line: an absolute path would leak local directory names.
         "input_file": input_path.as_posix(),
@@ -282,15 +356,15 @@ def analyze(
         "organization_size": len(data["people"]),
         "dependencies_count": len(data["dependencies"]),
         "person_lookup": person_lookup,
-        "dependency_type_counts": dependency_type_counts,
+        "dependency_type_counts": dict(
+            Counter(dep.get("type", "unknown") for dep in data["dependencies"])
+        ),
         "config_file": config.path.name if config.path else None,
         "unconfirmed_dependencies": sum(
             1 for d in data["dependencies"] if d.get("confirmed") is False
         ),
-        "functions_count": len(data.get("functions") or []),
-        "unconfirmed_functions": sum(
-            1 for f in data.get("functions") or [] if f.get("confirmed") is False
-        ),
+        "functions_count": len(functions),
+        "unconfirmed_functions": sum(1 for f in functions if f.get("confirmed") is False),
         "coverage_gaps": [
             str(gap) for gap in ((data.get("coverage") or {}).get("gaps") or []) if gap
         ],
@@ -301,68 +375,86 @@ def analyze(
         # A file name such as anna-org.yaml would identify someone too.
         metadata["input_file"] = pz.scrub(metadata["input_file"])
         metadata["input_name"] = pz.scrub(metadata["input_name"])
+    return metadata
 
-    # Generate reports
-    formats_to_generate = []
+
+def _expand_formats(formats) -> List[str]:
+    """Requested formats in order, without duplicates; 'all' is json, markdown and html."""
+    expanded: List[str] = []
     for fmt in formats:
-        expanded = ("json", "markdown", "html") if fmt.lower() == "all" else (fmt.lower(),)
-        formats_to_generate += [f for f in expanded if f not in formats_to_generate]
-    generated_files = []
+        names = ("json", "markdown", "html") if fmt.lower() == "all" else (fmt.lower(),)
+        expanded += [f for f in names if f not in expanded]
+    return expanded
+
+
+def _render_report(
+    fmt: str, run: _Analysis, metadata, input_path: Path, fail_above, min_score
+) -> str:
+    if fmt == "json":
+        return generate_json_report(run.results, metadata, run.findings, run.fixes)
+    if fmt == "markdown":
+        return generate_markdown_report(run.results, metadata, run.findings, run.fixes)
+    if fmt == "html":
+        return generate_html_report(run.results, metadata, run.findings, run.fixes, run.hrg)
+    if fmt == "sarif":
+        pz = run.pz
+        return generate_sarif_report(
+            run.findings,
+            pz.scrub(_artifact_uri(input_path)) if pz else _artifact_uri(input_path),
+            input_path.read_text(encoding="utf-8"),
+            {p: i for i, p in pz.mapping.items()} if pz else None,
+        )
+    return generate_junit_report(run.findings, run.results, fail_above, min_score)
+
+
+def _write_reports(
+    targets: Dict[str, Path], run: _Analysis, metadata, input_path: Path, fail_above, min_score
+) -> Tuple[List[str], bool]:
+    """Write each format to its file; returns the files written and whether any failed."""
+    written = []
     failed = False
-
-    for fmt in formats_to_generate:
-        if output and len(formats_to_generate) == 1:
-            # User specified output file
-            output_file = Path(output)
-        else:
-            output_file = output_dir / f"{base_name}_report{EXTENSIONS[fmt]}"
-
+    for fmt, output_file in targets.items():
         try:
-            if fmt == "json":
-                content = generate_json_report(results, metadata, findings, fixes)
-            elif fmt == "markdown":
-                content = generate_markdown_report(results, metadata, findings, fixes)
-            elif fmt == "html":
-                content = generate_html_report(results, metadata, findings, fixes, hrg)
-            elif fmt == "sarif":
-                content = generate_sarif_report(
-                    findings,
-                    pz.scrub(_artifact_uri(input_path)) if pz else _artifact_uri(input_path),
-                    input_path.read_text(encoding="utf-8"),
-                    {p: i for i, p in pz.mapping.items()} if pz else None,
-                )
-            else:
-                content = generate_junit_report(findings, results, fail_above, min_score)
+            content = _render_report(fmt, run, metadata, input_path, fail_above, min_score)
             output_file.write_text(content, encoding="utf-8")
-            generated_files.append(str(output_file))
+            written.append(str(output_file))
         except Exception as e:
             failed = True
             click.echo(f"Error: failed to generate {fmt} report: {e}", err=True)
+    return written, failed
 
-    # Generate visualization
-    if visualize:
-        try:
-            viz_file = output_dir / f"{base_name}_graph.html"
-            generate_graph_visualization(hrg, results, str(viz_file))
-            generated_files.append(str(viz_file))
-        except Exception as e:
-            click.echo(f"Warning: failed to generate visualization: {e}", err=True)
 
-    if not quiet:
-        render_summary(
-            Console(highlight=False),
-            input_file,
-            data,
-            results,
-            findings,
-            fixes,
-            generated_files,
-            breach,
-            config_file=metadata["config_file"],
-            confirmed_only=metadata["confirmed_only"],
+def _write_visualization(run: _Analysis, viz_file: Path) -> List[str]:
+    """The interactive graph; a failure is only a warning."""
+    try:
+        generate_graph_visualization(run.hrg, run.results, str(viz_file))
+    except Exception as e:
+        click.echo(f"Warning: failed to generate visualization: {e}", err=True)
+        return []
+    return [str(viz_file)]
+
+
+def inactivity_hint(data: Dict[str, Any], model: Optional[str], days: int) -> Optional[str]:
+    """
+    Outside hrg-3, a pointer to the people the data mark as inactive: HRG007 only runs on
+    functions, and without this they would go unnoticed under the default model.
+    """
+    if model == MODEL_V3:
+        return None
+    inactive = sum(1 for p in data["people"] if is_inactive(p.get("last_active"), days))
+    if not inactive:
+        return None
+    people = f"{inactive} {'person has' if inactive == 1 else 'people have'}"
+    if data.get("functions"):
+        return (
+            f"Note: {people} no activity seen for over {days} days (last_active); "
+            "run with --model hrg-3 to see which functions rely on them (HRG007)."
         )
-        if pz:
-            click.echo(f"Privacy: {privacy_text(metadata)}")
+    return f"Note: {people} no activity seen for over {days} days (last_active)."
+
+
+def _warn_acceptances(unused: List[Acceptance], findings: List[Finding]) -> None:
+    """Warn about risk acceptances that match nothing or have expired."""
     for acceptance in unused:
         target = f" {acceptance.target}" if acceptance.target else ""
         click.echo(
@@ -371,19 +463,13 @@ def analyze(
             err=True,
         )
     for finding in findings:
-        if finding.acceptance_expired:
+        expired = finding.acceptance
+        if finding.acceptance_expired and expired and expired.expires:
             click.echo(
                 f"Warning: risk acceptance for {finding.key} expired on "
-                f"{finding.acceptance.expires.isoformat()}.",
+                f"{expired.expires.isoformat()}.",
                 err=True,
             )
-
-    if failed:
-        sys.exit(1)
-    if breach:
-        if quiet:
-            click.echo(f"Error: {breach}", err=True)
-        sys.exit(EXIT_RISK)
 
 
 @cli.command()
@@ -550,24 +636,41 @@ def scan():
 )
 @click.option("--include-bots", is_flag=True, help="Keep bot accounts such as dependabot[bot].")
 @click.option(
+    "--activity/--no-activity",
+    default=True,
+    show_default=True,
+    help="Record when people with authority over a function were last active (last_active), "
+    "for the inactive-performer finding (HRG007).",
+)
+@click.option(
     "--token",
     envvar="HRG_GITHUB_TOKEN",
     help="GitHub token (default: GITHUB_TOKEN, GH_TOKEN or `gh auth token`).",
 )
+@click.option(
+    "--api-url",
+    envvar=["HRG_GITHUB_API_URL", "GITHUB_API_URL"],
+    default=API,
+    show_default=True,
+    help="GitHub API, e.g. https://github.example.com/api/v3 for GitHub Enterprise Server "
+    "(GITHUB_API_URL, set in GitHub Actions, is used when present).",
+)
 def scan_github(
     repo, org, max_repos, include_archived, include_forks, output, branch, max_prs, include_bots,
-    token,
+    activity, token, api_url,
 ):  # fmt: skip
     """
     Draft an organization from a GitHub repository or a whole organization.
 
-    REPO is OWNER/NAME. Reads pull request reviews, CODEOWNERS, branch rules and merges
-    without review, and writes a YAML draft where every dependency has its source,
-    evidence and confirmed: false. Review the draft, then run hrg analyze on it.
+    REPO is OWNER/NAME. Reads pull request reviews, CODEOWNERS, branch rules, merges
+    without review, releases and deployment environments, and writes a YAML draft where
+    every dependency and function has its source, evidence and confirmed: false. Review
+    the draft, then run hrg analyze on it.
 
     With --org, the most recently pushed repositories of the organization are scanned and
-    merged into one draft: people appear once, and the merge, release and admin functions
-    are kept per repository, so a person who is the only releaser of many services shows up.
+    merged into one draft: people appear once, and the merge, release, admin and deploy
+    functions are kept per repository, so a person who is the only releaser of many
+    services shows up.
 
     Example:
         hrg scan github my-org/payments-api
@@ -584,15 +687,8 @@ def scan_github(
     label = org or repo
     console = Console(stderr=True, highlight=False)
     output = output or Path(f"{(org or repo.split('/')[-1])}-org.yaml")
-    existing = None
-    if output.exists():
-        try:
-            existing = load_organization(output)
-        except ValueError as e:
-            click.echo(f"Error: {e}", err=True)
-            sys.exit(1)
-
-    client = GitHubClient(token or default_token())
+    existing = _existing_draft(output)
+    client = _github_client(token, api_url)
     if not client.token:
         console.print("[yellow]No GitHub token: limited to 60 requests per hour.[/]")
     try:
@@ -604,6 +700,7 @@ def scan_github(
                     max_repos=max_repos,
                     max_prs=max_prs,
                     include_bots=include_bots,
+                    record_activity=activity,
                     include_archived=include_archived,
                     include_forks=include_forks,
                     progress=status.update,
@@ -615,6 +712,7 @@ def scan_github(
                     branch=branch,
                     max_prs=max_prs,
                     include_bots=include_bots,
+                    record_activity=activity,
                     progress=lambda message: status.update(f"{repo}: {message}"),
                 )
                 result = scanner.scan()
@@ -624,10 +722,31 @@ def scan_github(
 
     notes = merge_with_existing(result, existing)
     output.write_text(draft_yaml(result, notes), encoding="utf-8")
+    _print_scan_summary(console, label, result, notes, output, is_org=bool(org))
 
+
+def _existing_draft(output: Path) -> Optional[Dict[str, Any]]:
+    """The draft a re-scan updates, or None; exits if it cannot be read."""
+    if not output.exists():
+        return None
+    try:
+        return load_organization(output)
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+def _github_client(token: Optional[str], api_url: str) -> GitHubClient:
+    try:
+        return GitHubClient(token or default_token(api_url), api=api_url)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="--api-url") from None
+
+
+def _print_scan_summary(console: Console, label, result, notes, output: Path, is_org) -> None:
     kinds = Counter(d["type"] for d in result.dependencies)
     unconfirmed = sum(1 for d in result.dependencies if d.get("confirmed") is False)
-    where = f"{len(result.repositories)} repositories" if org else result.branch
+    where = f"{len(result.repositories)} repositories" if is_org else result.branch
     console.print(
         f"\n[bold]{label}[/] · {result.pull_requests} merged PRs on {where} · "
         f"{result.api_calls} API calls"
